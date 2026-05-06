@@ -11,6 +11,8 @@ import type {
   ListOptions,
 } from "./types";
 import type { LlmJob } from "../schema";
+import { logger } from "../observability/logger";
+import { jobsTotal, jobDurationSeconds } from "../observability/metrics";
 
 const QUEUE_NAME = "llm-job";
 
@@ -34,6 +36,18 @@ export function createJobRunner(config: RunnerConfig): JobRunner {
   async function processJob(pgBossJob: PgBoss.Job<{ jobId: number; prompt: string }>) {
     const { jobId, prompt } = pgBossJob.data;
 
+    // Fetch user-facing job name for metric/log labels.
+    const [row] = await db
+      .select({ name: llmJobs.name })
+      .from(llmJobs)
+      .where(eq(llmJobs.id, jobId))
+      .limit(1);
+    const jobName = row?.name ?? "unknown";
+    const log = logger.child({ job: jobName, job_id: jobId });
+    const start = process.hrtime.bigint();
+
+    log.info("job_started");
+
     await db
       .update(llmJobs)
       .set({ status: "running", startedAt: new Date() })
@@ -53,26 +67,61 @@ export function createJobRunner(config: RunnerConfig): JobRunner {
         .where(eq(llmJobs.id, jobId));
     };
 
-    await executeSshJob(config.ssh, prompt, {
-      onChunk: async (chunk) => {
-        buffer += chunk;
-        if (Date.now() - lastFlush > flushInterval) {
+    const recordOutcome = async (
+      status: "success" | "failed",
+      exitCode: number | null,
+      error: string | null,
+    ) => {
+      const duration = Number(process.hrtime.bigint() - start) / 1e9;
+      jobsTotal.inc({ job: jobName, status });
+      jobDurationSeconds.observe({ job: jobName, status }, duration);
+      if (status === "success") {
+        log.info({ duration_ms: Math.round(duration * 1000) }, "job_completed");
+      } else {
+        log.error(
+          { duration_ms: Math.round(duration * 1000), exit_code: exitCode, error },
+          "job_failed",
+        );
+      }
+    };
+
+    try {
+      await executeSshJob(config.ssh, prompt, {
+        onChunk: async (chunk) => {
+          buffer += chunk;
+          if (Date.now() - lastFlush > flushInterval) {
+            await flush();
+          }
+        },
+        onDone: async (exitCode, error) => {
           await flush();
-        }
-      },
-      onDone: async (exitCode, error) => {
-        await flush();
-        await db
-          .update(llmJobs)
-          .set({
-            status: exitCode === 0 ? "success" : "failed",
-            exitCode: exitCode ?? null,
-            error: error ?? null,
-            finishedAt: new Date(),
-          })
-          .where(eq(llmJobs.id, jobId));
-      },
-    });
+          const status = exitCode === 0 ? "success" : "failed";
+          await recordOutcome(status, exitCode ?? null, error ?? null);
+          await db
+            .update(llmJobs)
+            .set({
+              status,
+              exitCode: exitCode ?? null,
+              error: error ?? null,
+              finishedAt: new Date(),
+            })
+            .where(eq(llmJobs.id, jobId));
+        },
+      });
+    } catch (err) {
+      await flush();
+      const msg = err instanceof Error ? err.message : String(err);
+      await recordOutcome("failed", null, msg);
+      await db
+        .update(llmJobs)
+        .set({
+          status: "failed",
+          error: msg,
+          finishedAt: new Date(),
+        })
+        .where(eq(llmJobs.id, jobId));
+      throw err;
+    }
   }
 
   return {

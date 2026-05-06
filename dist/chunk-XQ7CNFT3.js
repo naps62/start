@@ -1,15 +1,22 @@
-"use strict";Object.defineProperty(exports, "__esModule", {value: true}); function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; } function _nullishCoalesce(lhs, rhsFn) { if (lhs != null) { return lhs; } else { return rhsFn(); } } function _optionalChain(ops) { let lastAccessLHS = undefined; let value = ops[0]; let i = 1; while (i < ops.length) { const op = ops[i]; const fn = ops[i + 1]; i += 2; if ((op === 'optionalAccess' || op === 'optionalCall') && value == null) { return undefined; } if (op === 'access' || op === 'optionalAccess') { lastAccessLHS = value; value = fn(value); } else if (op === 'call' || op === 'optionalCall') { value = fn((...args) => value.call(lastAccessLHS, ...args)); lastAccessLHS = undefined; } } return value; }
-
-var _chunkWDBYORVZcjs = require('./chunk-WDBYORVZ.cjs');
+import {
+  logger
+} from "./chunk-THZKQPHU.js";
+import {
+  jobDurationSeconds,
+  jobsTotal
+} from "./chunk-Q4Q4AQL5.js";
+import {
+  llmJobs
+} from "./chunk-65CQECWX.js";
 
 // src/job-runner/runner.ts
-var _pgboss = require('pg-boss'); var _pgboss2 = _interopRequireDefault(_pgboss);
-var _postgres = require('postgres'); var _postgres2 = _interopRequireDefault(_postgres);
-var _postgresjs = require('drizzle-orm/postgres-js');
-var _drizzleorm = require('drizzle-orm');
+import PgBoss from "pg-boss";
+import postgres from "postgres";
+import { drizzle } from "drizzle-orm/postgres-js";
+import { eq, desc, sql as dsql } from "drizzle-orm";
 
 // src/job-runner/ssh.ts
-var _ssh2 = require('ssh2');
+import { Client } from "ssh2";
 function parseHost(hostStr) {
   let username = "root";
   let host = hostStr;
@@ -39,7 +46,7 @@ function executeSshJob(config, prompt, callbacks) {
   const shellEscapedPrompt = prompt.replace(/'/g, `'\\''`);
   const remoteCmd = `cd ${config.repoPath} && set -a && [ -f .env ] && . ./.env; set +a && export PATH="$HOME/.local/bin:$PATH" && claude --print --dangerously-skip-permissions '${shellEscapedPrompt}'`;
   const { username, host, port } = parseHost(config.host);
-  const conn = new (0, _ssh2.Client)();
+  const conn = new Client();
   const connectOpts = {
     host,
     port,
@@ -85,14 +92,19 @@ function executeSshJob(config, prompt, callbacks) {
 // src/job-runner/runner.ts
 var QUEUE_NAME = "llm-job";
 function createJobRunner(config) {
-  const flushInterval = _nullishCoalesce(config.logFlushIntervalMs, () => ( 1500));
-  const boss = new (0, _pgboss2.default)({ connectionString: config.databaseUrl });
-  const pgClient = _postgres2.default.call(void 0, config.databaseUrl, { max: 3 });
-  const db = _postgresjs.drizzle.call(void 0, pgClient);
+  const flushInterval = config.logFlushIntervalMs ?? 1500;
+  const boss = new PgBoss({ connectionString: config.databaseUrl });
+  const pgClient = postgres(config.databaseUrl, { max: 3 });
+  const db = drizzle(pgClient);
   boss.on("error", (err) => console.error("[llm-job-runner] pg-boss error:", err));
   async function processJob(pgBossJob) {
     const { jobId, prompt } = pgBossJob.data;
-    await db.update(_chunkWDBYORVZcjs.llmJobs).set({ status: "running", startedAt: /* @__PURE__ */ new Date() }).where(_drizzleorm.eq.call(void 0, _chunkWDBYORVZcjs.llmJobs.id, jobId));
+    const [row] = await db.select({ name: llmJobs.name }).from(llmJobs).where(eq(llmJobs.id, jobId)).limit(1);
+    const jobName = row?.name ?? "unknown";
+    const log = logger.child({ job: jobName, job_id: jobId });
+    const start = process.hrtime.bigint();
+    log.info("job_started");
+    await db.update(llmJobs).set({ status: "running", startedAt: /* @__PURE__ */ new Date() }).where(eq(llmJobs.id, jobId));
     let buffer = "";
     let lastFlush = Date.now();
     const flush = async () => {
@@ -100,25 +112,52 @@ function createJobRunner(config) {
       const pending = buffer;
       buffer = "";
       lastFlush = Date.now();
-      await db.update(_chunkWDBYORVZcjs.llmJobs).set({ log: _drizzleorm.sql`${_chunkWDBYORVZcjs.llmJobs.log} || ${pending}` }).where(_drizzleorm.eq.call(void 0, _chunkWDBYORVZcjs.llmJobs.id, jobId));
+      await db.update(llmJobs).set({ log: dsql`${llmJobs.log} || ${pending}` }).where(eq(llmJobs.id, jobId));
     };
-    await executeSshJob(config.ssh, prompt, {
-      onChunk: async (chunk) => {
-        buffer += chunk;
-        if (Date.now() - lastFlush > flushInterval) {
-          await flush();
-        }
-      },
-      onDone: async (exitCode, error) => {
-        await flush();
-        await db.update(_chunkWDBYORVZcjs.llmJobs).set({
-          status: exitCode === 0 ? "success" : "failed",
-          exitCode: _nullishCoalesce(exitCode, () => ( null)),
-          error: _nullishCoalesce(error, () => ( null)),
-          finishedAt: /* @__PURE__ */ new Date()
-        }).where(_drizzleorm.eq.call(void 0, _chunkWDBYORVZcjs.llmJobs.id, jobId));
+    const recordOutcome = async (status, exitCode, error) => {
+      const duration = Number(process.hrtime.bigint() - start) / 1e9;
+      jobsTotal.inc({ job: jobName, status });
+      jobDurationSeconds.observe({ job: jobName, status }, duration);
+      if (status === "success") {
+        log.info({ duration_ms: Math.round(duration * 1e3) }, "job_completed");
+      } else {
+        log.error(
+          { duration_ms: Math.round(duration * 1e3), exit_code: exitCode, error },
+          "job_failed"
+        );
       }
-    });
+    };
+    try {
+      await executeSshJob(config.ssh, prompt, {
+        onChunk: async (chunk) => {
+          buffer += chunk;
+          if (Date.now() - lastFlush > flushInterval) {
+            await flush();
+          }
+        },
+        onDone: async (exitCode, error) => {
+          await flush();
+          const status = exitCode === 0 ? "success" : "failed";
+          await recordOutcome(status, exitCode ?? null, error ?? null);
+          await db.update(llmJobs).set({
+            status,
+            exitCode: exitCode ?? null,
+            error: error ?? null,
+            finishedAt: /* @__PURE__ */ new Date()
+          }).where(eq(llmJobs.id, jobId));
+        }
+      });
+    } catch (err) {
+      await flush();
+      const msg = err instanceof Error ? err.message : String(err);
+      await recordOutcome("failed", null, msg);
+      await db.update(llmJobs).set({
+        status: "failed",
+        error: msg,
+        finishedAt: /* @__PURE__ */ new Date()
+      }).where(eq(llmJobs.id, jobId));
+      throw err;
+    }
   }
   return {
     async start() {
@@ -133,11 +172,11 @@ function createJobRunner(config) {
       await pgClient.end();
     },
     async enqueue(options) {
-      const [row] = await db.insert(_chunkWDBYORVZcjs.llmJobs).values({
+      const [row] = await db.insert(llmJobs).values({
         name: options.name,
         prompt: options.prompt,
         status: "pending"
-      }).returning({ id: _chunkWDBYORVZcjs.llmJobs.id });
+      }).returning({ id: llmJobs.id });
       await boss.send(QUEUE_NAME, {
         jobId: row.id,
         prompt: options.prompt
@@ -152,7 +191,7 @@ function createJobRunner(config) {
       });
       await boss.createQueue(scheduleName);
       await boss.work(scheduleName, async ([job]) => {
-        const [row] = await db.insert(_chunkWDBYORVZcjs.llmJobs).values({
+        const [row] = await db.insert(llmJobs).values({
           name: job.data.name,
           prompt: job.data.prompt,
           status: "pending"
@@ -164,15 +203,15 @@ function createJobRunner(config) {
       });
     },
     async getJob(id) {
-      const rows = await db.select().from(_chunkWDBYORVZcjs.llmJobs).where(_drizzleorm.eq.call(void 0, _chunkWDBYORVZcjs.llmJobs.id, id)).limit(1);
-      return _nullishCoalesce(rows[0], () => ( null));
+      const rows = await db.select().from(llmJobs).where(eq(llmJobs.id, id)).limit(1);
+      return rows[0] ?? null;
     },
     async listJobs(options) {
-      return db.select().from(_chunkWDBYORVZcjs.llmJobs).orderBy(_drizzleorm.desc.call(void 0, _chunkWDBYORVZcjs.llmJobs.createdAt)).limit(_nullishCoalesce(_optionalChain([options, 'optionalAccess', _ => _.limit]), () => ( 50)));
+      return db.select().from(llmJobs).orderBy(desc(llmJobs.createdAt)).limit(options?.limit ?? 50);
     }
   };
 }
 
-
-
-exports.createJobRunner = createJobRunner;
+export {
+  createJobRunner
+};
