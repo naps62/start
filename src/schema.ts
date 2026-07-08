@@ -47,6 +47,7 @@ export const llmJobs = pgTable(
     log: text("log").notNull().default(""),
     exitCode: integer("exit_code"),
     error: text("error"),
+    sessionId: text("session_id"),
     startedAt: timestamp("started_at", { withTimezone: true }),
     finishedAt: timestamp("finished_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),

@@ -47,10 +47,14 @@ export interface SshJobCallbacks {
 export function executeSshJob(
   config: SshConfig,
   prompt: string,
+  sessionId: string,
   callbacks: SshJobCallbacks
 ): Promise<void> {
   const shellEscapedPrompt = prompt.replace(/'/g, `'\\''`);
-  const remoteCmd = `cd ${config.repoPath} && set -a && [ -f .env ] && . ./.env; set +a && export PATH="$HOME/.local/bin:$PATH" && claude --print --dangerously-skip-permissions '${shellEscapedPrompt}'`;
+  // sessionId is a generated UUID; passing it to `claude --session-id` makes the
+  // resulting session resumable (`claude --resume <sessionId>`) on the remote host.
+  const shellEscapedSessionId = sessionId.replace(/'/g, `'\\''`);
+  const remoteCmd = `cd ${config.repoPath} && set -a && [ -f .env ] && . ./.env; set +a && export PATH="$HOME/.local/bin:$PATH" && claude --print --dangerously-skip-permissions --session-id '${shellEscapedSessionId}' '${shellEscapedPrompt}'`;
 
   const { username, host, port } = parseHost(config.host);
   const conn = new Client();

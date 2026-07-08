@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import PgBoss from "pg-boss";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
@@ -48,9 +49,13 @@ export function createJobRunner(config: RunnerConfig): JobRunner {
 
     log.info("job_started");
 
+    // Generate the Claude session id up front so it can be persisted and the
+    // session resumed manually later (`claude --resume <sessionId>`).
+    const sessionId = randomUUID();
+
     await db
       .update(llmJobs)
-      .set({ status: "running", startedAt: new Date() })
+      .set({ status: "running", startedAt: new Date(), sessionId })
       .where(eq(llmJobs.id, jobId));
 
     let buffer = "";
@@ -86,7 +91,7 @@ export function createJobRunner(config: RunnerConfig): JobRunner {
     };
 
     try {
-      await executeSshJob(config.ssh, prompt, {
+      await executeSshJob(config.ssh, prompt, sessionId, {
         onChunk: async (chunk) => {
           buffer += chunk;
           if (Date.now() - lastFlush > flushInterval) {
